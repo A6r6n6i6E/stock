@@ -1,8 +1,8 @@
-streamlit
-yfinance
-pandas>=1.4,<2.0
-plotly
-numpy<2.0
-pandas-ta
-scipy
+streamlit==1.48.0
+yfinance==0.2.65
+pandas==1.5.3
+plotly==6.2.0
+numpy==1.26.4
+pandas-ta==0.3.14b0
+scipy==1.13.1
 setuptools
