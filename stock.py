@@ -117,11 +117,16 @@ def detect_trendlines(extrema_idx, prices, tolerance=5):
 # DANE + INDIKATORY
 # =========================
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_data(symbol, period, interval):
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=False)
     if df.empty:
         return df
-    df = flatten_columns(df)
+    # Normalizacja nazw kolumn
+    df.columns = [col.upper().replace(" ", "_") for col in df.columns]
+    # Upewniamy się, że kolumny nie mają MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join([str(i) for i in col if i]).upper() for col in df.columns]
     # Indykatory
     df.ta.sma(length=50, append=True)
     df.ta.sma(length=200, append=True)
@@ -141,6 +146,7 @@ def load_data(symbol, period, interval):
     df.loc[df["FWD_RET_1"] > thr, "TARGET"] = 1
     df.loc[df["FWD_RET_1"] < -thr, "TARGET"] = -1
     return df
+
 
 df = load_data(symbol, period, interval)
 if df.empty:
