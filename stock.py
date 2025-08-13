@@ -1,13 +1,33 @@
+# app.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.graph_objs as go
 import numpy as np
+import plotly.graph_objs as go
 import pandas_ta as ta
 from scipy.signal import argrelextrema
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-st.set_page_config(layout="wide")
+# =========================
+# USTAWIENIA APLIKACJI
+# =========================
+st.set_page_config(page_title="WIG20 – sygnały i AI", layout="wide")
 
+# Prosty CSS pod telefon: większe fonty, większe hitboxy
+st.markdown("""
+<style>
+/* większe fonty na telefonie */
+html, body, [class*="css"]  { font-size: 16px; }
+div.block-container { padding-top: 1rem; padding-bottom: 1rem; }
+.stButton>button { padding: 0.6rem 1rem; border-radius: 0.8rem; }
+.stSelectbox label, .stNumberInput label { font-weight: 600; }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# LISTA SPÓŁEK
+# =========================
 wig20_dict = {
     "ALIOR": "ALR.WA",
     "ALLEGRO": "ALE.WA",
@@ -31,31 +51,33 @@ wig20_dict = {
     "ZABKA": "ZAB.WA"
 }
 
-ticker = st.sidebar.selectbox("Wybierz spółkę z WIG20", list(wig20_dict.keys()))
+# =========================
+# KONTROLKI U GÓRY (MOBILNIE)
+# =========================
+c1, c2 = st.columns([1.1, 1.2])
+with c1:
+    ticker = st.selectbox("Spółka WIG20", list(wig20_dict.keys()), index=11)  # domyślnie ORANGEPL
+with c2:
+    interval = st.selectbox("Interwał", ["1d", "1h"], index=0)
+
+c3, c4, c5 = st.columns([1, 1, 1])
+with c3:
+    period = st.selectbox("Zakres", ["1mo", "3mo", "6mo", "1y", "2y"], index=3)
+with c4:
+    num_sessions = st.number_input("Ile ostatnich świec", min_value=50, max_value=2000, value=300, step=50)
+with c5:
+    use_ai = st.toggle("Włącz AI (RandomForest)", value=True)
+
 symbol = wig20_dict[ticker]
 
-period = st.sidebar.selectbox("Zakres czasowy", ["5d", "1mo", "3mo", "6mo", "1y", "2y"])
-interval = st.sidebar.selectbox("Interwał", ["1d", "1h"])
-num_sessions = st.sidebar.number_input("Ile ostatnich sesji wyświetlić?", min_value=10, max_value=500, value=50)
-
-def flatten_columns(df):
+# =========================
+# POMOCNICZE
+# =========================
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ['_'.join([str(i) for i in col if i]).upper() for col in df.columns]
     else:
         df.columns = [str(col).upper() for col in df.columns]
-    return df
-
-@st.cache_data
-def load_data(symbol, period, interval):
-    df = yf.download(symbol, period=period, interval=interval)
-    if df.empty:
-        return df
-    df = flatten_columns(df)
-    df.ta.sma(length=50, append=True)
-    df.ta.sma(length=200, append=True)
-    df.ta.bbands(length=20, std=2, append=True)
-    df.ta.rsi(length=14, append=True)
-    df.ta.macd(append=True)
     return df
 
 def has_data(df, col):
@@ -67,14 +89,7 @@ def find_crossovers(short_sma, long_sma):
     signals[(short_sma < long_sma) & (short_sma.shift(1) >= long_sma.shift(1))] = -1
     return signals
 
-def find_ohlc_columns(df):
-    cols = {}
-    for prefix in ['OPEN', 'HIGH', 'LOW', 'CLOSE']:
-        matches = [col for col in df.columns if col.startswith(prefix)]
-        cols[prefix] = matches[0] if matches else None
-    return cols
-
-def detect_trendlines(extrema_idx, prices, kind='high', tolerance=5):
+def detect_trendlines(extrema_idx, prices, tolerance=5):
     used = set()
     lines = []
     for i in range(len(extrema_idx)):
@@ -99,117 +114,71 @@ def detect_trendlines(extrema_idx, prices, kind='high', tolerance=5):
                     break
     return lines
 
-df = load_data(symbol, period, interval)
+# =========================
+# DANE + INDIKATORY
+# =========================
+@st.cache_data(show_spinner=False)
+def load_data(symbol, period, interval):
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=False)
+    if df.empty:
+        return df
+    df = flatten_columns(df)
+    # Indykatory
+    df.ta.sma(length=50, append=True)
+    df.ta.sma(length=200, append=True)
+    df.ta.bbands(length=20, std=2, append=True)
+    df.ta.rsi(length=14, append=True)
+    df.ta.macd(append=True)
+    # Dodatkowe cechy
+    df["RET_1"] = df["CLOSE"].pct_change()
+    df["RET_5"] = df["CLOSE"].pct_change(5)
+    df["VOL_5"] = df["RET_1"].rolling(5).std()
+    df["VOL_20"] = df["RET_1"].rolling(20).std()
+    df["MA_GAP"] = (df["CLOSE"] - df["SMA_50"]) / df["CLOSE"]
+    # Etykiety do ML na podstawie zwrotu w przód (unikamy lookahead w cechach)
+    df["FWD_RET_1"] = df["CLOSE"].shift(-1) / df["CLOSE"] - 1.0
+    # Klasy: 1 kupno, -1 sprzedaż, 0 brak (strefa martwa)
+    thr = 0.001 if interval == "1d" else 0.0005
+    df["TARGET"] = 0
+    df.loc[df["FWD_RET_1"] > thr, "TARGET"] = 1
+    df.loc[df["FWD_RET_1"] < -thr, "TARGET"] = -1
+    return df
 
+df = load_data(symbol, period, interval)
 if df.empty:
     st.warning("Brak danych dla wybranego zakresu i interwału.")
-else:
-    df = df.tail(num_sessions)
-    st.dataframe(df)
+    st.stop()
 
-    cols = find_ohlc_columns(df)
+df = df.tail(num_sessions).copy()
 
-    if None in cols.values():
-        st.error(f"Brak wymaganych kolumn OHLC: {cols}")
-        st.stop()
+# =========================
+# WYKRES CENY + SYGNAŁY HEURYSTYCZNE
+# =========================
+close_col, high_col, low_col, open_col = "CLOSE", "HIGH", "LOW", "OPEN"
 
-    fig_price = go.Figure()
-    fig_price.add_trace(go.Candlestick(
-        x=df.index,
-        open=df[cols['OPEN']],
-        high=df[cols['HIGH']],
-        low=df[cols['LOW']],
-        close=df[cols['CLOSE']],
-        increasing_line_color='green',
-        decreasing_line_color='red',
-        name='Świece'
-    ))
+fig_price = go.Figure()
+fig_price.add_trace(go.Candlestick(
+    x=df.index,
+    open=df[open_col],
+    high=df[high_col],
+    low=df[low_col],
+    close=df[close_col],
+    increasing_line_color='green',
+    decreasing_line_color='red',
+    name='Świece'
+))
 
-    if has_data(df, 'SMA_50'):
-        fig_price.add_trace(go.Scatter(
-            x=df.index,
-            y=df['SMA_50'],
-            mode='lines',
-            name='SMA 50',
-            line=dict(color='blue', width=2)
-        ))
+# SMA
+if has_data(df, 'SMA_50'):
+    fig_price.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], mode='lines',
+                                   name='SMA 50', line=dict(width=2)))
+if has_data(df, 'SMA_200'):
+    fig_price.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], mode='lines',
+                                   name='SMA 200', line=dict(width=2)))
 
-    if has_data(df, 'SMA_200'):
-        fig_price.add_trace(go.Scatter(
-            x=df.index,
-            y=df['SMA_200'],
-            mode='lines',
-            name='SMA 200',
-            line=dict(color='cyan', width=2)
-        ))
-
-    if has_data(df, cols['CLOSE']):
-        z_price = np.polyfit(np.arange(len(df)), df[cols['CLOSE']], 1)
-        p_price = np.poly1d(z_price)
-        fig_price.add_trace(go.Scatter(
-            x=df.index,
-            y=p_price(np.arange(len(df))),
-            mode='lines',
-            name='Linia trendu ceny',
-            line=dict(color='purple', dash='dash')
-        ))
-
-    if has_data(df, 'SMA_50') and has_data(df, 'SMA_200'):
-        signals = find_crossovers(df['SMA_50'], df['SMA_200'])
-        buy_signals = df[signals == 1]
-        sell_signals = df[signals == -1]
-
-        fig_price.add_trace(go.Scatter(
-            x=buy_signals.index,
-            y=buy_signals[cols['CLOSE']],
-            mode='markers',
-            name='Sygnał kupna',
-            marker=dict(color='green', size=12, symbol='triangle-up')
-        ))
-
-        fig_price.add_trace(go.Scatter(
-            x=sell_signals.index,
-            y=sell_signals[cols['CLOSE']],
-            mode='markers',
-            name='Sygnał sprzedaży',
-            marker=dict(color='red', size=12, symbol='triangle-down')
-        ))
-
-    close_prices = df[cols['CLOSE']].values
-    local_max_idx = argrelextrema(close_prices, np.greater)[0]
-    local_min_idx = argrelextrema(close_prices, np.less)[0]
-
-    max_lines = detect_trendlines(local_max_idx, close_prices, kind='high')
-    min_lines = detect_trendlines(local_min_idx, close_prices, kind='low')
-
-    fig_price.update_layout(
-        title=f"Notowania: {ticker} ({symbol}) z sygnałami SMA i liniami trendu",
-        xaxis_title="Data",
-        yaxis_title="Cena / Wskaźniki",
-        xaxis_rangeslider_visible=False,
-        height=600
-    )
-
-    fig_rsi = go.Figure()
-    if has_data(df, 'RSI_14'):
-        rsi_data = df['RSI_14'].dropna()
-        fig_rsi.add_trace(go.Scatter(
-            x=rsi_data.index,
-            y=rsi_data,
-            mode='lines',
-            name='RSI 14',
-            line=dict(color='purple')
-        ))
-        fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="30", annotation_position="bottom right")
-        fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="70", annotation_position="top right")
-
-    fig_rsi.update_layout(
-        title="RSI (Relative Strength Index)",
-        yaxis=dict(range=[0, 100]),
-        height=300,
-        xaxis_rangeslider_visible=False
-    )
-
-    st.plotly_chart(fig_price, use_container_width=True)
-    st.plotly_chart(fig_rsi, use_container_width=True)
-
+# Prosta linia trendu ceny (regresja liniowa po indeksie)
+z_price = np.polyfit(np.arange(len(df)), df[close_col].values, 1)
+p_price = np.poly1d(z_price)
+fig_price.add_trace(go.Scatter(
+    x=df.index, y=p_price(np.arange(len(df))), mode='lines',
+    n
