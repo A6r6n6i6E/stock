@@ -4,6 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import mpld3
 from mpld3 import plugins
+import matplotlib.dates as mdates
 
 # =====================
 # Funkcja pobierająca dane
@@ -24,17 +25,17 @@ def plot_with_tooltips(df):
     # Usuwamy wiersze z brakami danych
     df = df.dropna(subset=["Date", "Close"])
 
-    # Zamiana na numpy array (mpld3 tego wymaga)
-    dates = df["Date"].to_numpy()
+    # Zamiana dat na format liczbowy matplotliba
+    dates_num = mdates.date2num(df["Date"].tolist())  # liczby zamiast datetime
     closes = df["Close"].to_numpy()
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    scatter = ax.scatter(dates, closes, c='blue', s=20)
+    scatter = ax.scatter(dates_num, closes, c='blue', s=20)
 
-    # Tooltipy
+    # Tooltipy (pokazujemy datę jako string w formacie RRRR-MM-DD)
     labels = [
         f"<b>{d.strftime('%Y-%m-%d')}</b><br>Cena: {c:.2f}"
-        for d, c in zip(dates, closes)
+        for d, c in zip(df["Date"], closes)
     ]
 
     tooltip = plugins.PointHTMLTooltip(scatter, labels, voffset=10, hoffset=10)
@@ -43,6 +44,7 @@ def plot_with_tooltips(df):
     ax.set_title("Wykres z interaktywnymi tooltipami", fontsize=14)
     ax.set_xlabel("Data")
     ax.set_ylabel("Cena zamknięcia")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
     fig.autofmt_xdate()
 
     return fig
@@ -63,6 +65,5 @@ if st.button("Pobierz dane i narysuj wykres"):
         st.error("Brak danych dla podanego symbolu.")
     else:
         fig = plot_with_tooltips(df)
-        # Wyświetlenie w Streamlit
         html_str = mpld3.fig_to_html(fig)
         st.components.v1.html(html_str, height=600, scrolling=True)
