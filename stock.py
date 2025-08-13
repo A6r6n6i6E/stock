@@ -4,7 +4,6 @@ import pandas as pd
 import plotly.graph_objs as go
 import numpy as np
 import pandas_ta as ta
-from scipy.signal import argrelextrema
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
@@ -25,26 +24,11 @@ st.markdown("""
 # LISTA SPÓŁEK
 # ------------------------------
 wig20_dict = {
-    "ALIOR": "ALR.WA",
-    "ALLEGRO": "ALE.WA",
-    "BUDIMEX": "BDX.WA",
-    "CCC": "CCC.WA",
-    "CDPROJEKT": "CDR.WA",
-    "DINOPL": "DNP.WA",
-    "KETY": "KTY.WA",
-    "KGHM": "KGH.WA",
-    "KRUK": "KRK.WA",
-    "LPP": "LPP.WA",
-    "MBANK": "MBK.WA",
-    "ORANGEPL": "OPL.WA",
-    "PEKAO": "PEO.WA",
-    "PEPCO": "PCO.WA",
-    "PGE": "PGE.WA",
-    "PKNORLEN": "PKN.WA",
-    "PKOBP": "PKO.WA",
-    "PZU": "PZU.WA",
-    "SANPL": "SAN.WA",
-    "ZABKA": "ZAB.WA"
+    "ALIOR": "ALR.WA", "ALLEGRO": "ALE.WA", "BUDIMEX": "BDX.WA", "CCC": "CCC.WA",
+    "CDPROJEKT": "CDR.WA", "DINOPL": "DNP.WA", "KETY": "KTY.WA", "KGHM": "KGH.WA",
+    "KRUK": "KRK.WA", "LPP": "LPP.WA", "MBANK": "MBK.WA", "ORANGEPL": "OPL.WA",
+    "PEKAO": "PEO.WA", "PEPCO": "PCO.WA", "PGE": "PGE.WA", "PKNORLEN": "PKN.WA",
+    "PKOBP": "PKO.WA", "PZU": "PZU.WA", "SANPL": "SAN.WA", "ZABKA": "ZAB.WA"
 }
 
 ticker = st.sidebar.selectbox("📊 Wybierz spółkę z WIG20", list(wig20_dict.keys()))
@@ -69,15 +53,17 @@ def load_data(symbol, period, interval):
     if df.empty:
         return df
     df = flatten_columns(df)
-    df.ta.sma(length=50, append=True)
-    df.ta.sma(length=200, append=True)
-    df.ta.bbands(length=20, std=2, append=True)
-    df.ta.rsi(length=14, append=True)
-    df.ta.macd(append=True)
-    return df
 
-def has_data(df, col):
-    return col in df.columns and df[col].notna().any()
+    # Wybór kolumny CLOSE
+    close_col = [c for c in df.columns if c.startswith("CLOSE")][0]
+
+    # Wskaźniki
+    df.ta.sma(close=close_col, length=50, append=True)
+    df.ta.sma(close=close_col, length=200, append=True)
+    df.ta.rsi(close=close_col, length=14, append=True)
+    df.ta.macd(close=close_col, append=True)
+
+    return df
 
 def find_crossovers(short_sma, long_sma):
     signals = pd.Series(0, index=short_sma.index)
@@ -108,13 +94,22 @@ if None in cols.values():
     st.stop()
 
 # ------------------------------
+# WYSZUKIWANIE NAZW WSKAŹNIKÓW
+# ------------------------------
+sma_50_col = [c for c in df.columns if "SMA_50" in c][0]
+sma_200_col = [c for c in df.columns if "SMA_200" in c][0]
+rsi_col = [c for c in df.columns if "RSI_14" in c][0]
+macd_col = [c for c in df.columns if "MACD_12_26_9" in c][0]
+macd_signal_col = [c for c in df.columns if "MACDs_12_26_9" in c][0]
+
+# ------------------------------
 # SYGNAŁY ZŁOŻONE (SMA + RSI + MACD)
 # ------------------------------
-signals = find_crossovers(df['SMA_50'], df['SMA_200'])
-rsi_buy = df['RSI_14'] < 30
-rsi_sell = df['RSI_14'] > 70
-macd_buy = df['MACD_12_26_9'] > df['MACDs_12_26_9']
-macd_sell = df['MACD_12_26_9'] < df['MACDs_12_26_9']
+signals = find_crossovers(df[sma_50_col], df[sma_200_col])
+rsi_buy = df[rsi_col] < 30
+rsi_sell = df[rsi_col] > 70
+macd_buy = df[macd_col] > df[macd_signal_col]
+macd_sell = df[macd_col] < df[macd_signal_col]
 
 final_buy = (signals == 1) & rsi_buy & macd_buy
 final_sell = (signals == -1) & rsi_sell & macd_sell
@@ -145,55 +140,43 @@ fig_price.add_trace(go.Candlestick(
     name='Świece'
 ))
 
-if has_data(df, 'SMA_50'):
-    fig_price.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], mode='lines', name='SMA 50', line=dict(color='blue', width=2)))
-if has_data(df, 'SMA_200'):
-    fig_price.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], mode='lines', name='SMA 200', line=dict(color='cyan', width=2)))
+fig_price.add_trace(go.Scatter(x=df.index, y=df[sma_50_col], mode='lines', name='SMA 50', line=dict(color='blue', width=2)))
+fig_price.add_trace(go.Scatter(x=df.index, y=df[sma_200_col], mode='lines', name='SMA 200', line=dict(color='cyan', width=2)))
 
 fig_price.add_trace(go.Scatter(
-    x=buy_signals.index,
-    y=buy_signals[cols['CLOSE']],
-    mode='markers',
-    name='Sygnał kupna',
+    x=buy_signals.index, y=buy_signals[cols['CLOSE']],
+    mode='markers', name='Sygnał kupna',
     marker=dict(color='lime', size=14, symbol='triangle-up')
 ))
 fig_price.add_trace(go.Scatter(
-    x=sell_signals.index,
-    y=sell_signals[cols['CLOSE']],
-    mode='markers',
-    name='Sygnał sprzedaży',
+    x=sell_signals.index, y=sell_signals[cols['CLOSE']],
+    mode='markers', name='Sygnał sprzedaży',
     marker=dict(color='red', size=14, symbol='triangle-down')
 ))
 
 fig_price.update_layout(
     title=f"📈 Notowania: {ticker} ({symbol})",
-    xaxis_title="Data",
-    yaxis_title="Cena",
-    xaxis_rangeslider_visible=False,
-    height=600
+    xaxis_title="Data", yaxis_title="Cena",
+    xaxis_rangeslider_visible=False, height=600
 )
 
 # ------------------------------
 # WYKRES RSI
 # ------------------------------
 fig_rsi = go.Figure()
-if has_data(df, 'RSI_14'):
-    rsi_data = df['RSI_14'].dropna()
-    fig_rsi.add_trace(go.Scatter(x=rsi_data.index, y=rsi_data, mode='lines', name='RSI 14', line=dict(color='purple')))
-    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
-    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
-
+rsi_data = df[rsi_col].dropna()
+fig_rsi.add_trace(go.Scatter(x=rsi_data.index, y=rsi_data, mode='lines', name='RSI 14', line=dict(color='purple')))
+fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
+fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
 fig_rsi.update_layout(
     title="RSI (Relative Strength Index)",
-    yaxis=dict(range=[0, 100]),
-    height=300,
-    xaxis_rangeslider_visible=False
+    yaxis=dict(range=[0, 100]), height=300, xaxis_rangeslider_visible=False
 )
 
 # ------------------------------
 # MACHINE LEARNING — PROGNOZA
 # ------------------------------
-features = df[['SMA_50', 'SMA_200', 'RSI_14', 'MACD_12_26_9', 'MACDs_12_26_9']].dropna()
+features = df[[sma_50_col, sma_200_col, rsi_col, macd_col, macd_signal_col]].dropna()
 labels = (df[cols['CLOSE']].shift(-1) > df[cols['CLOSE']]).astype(int).loc[features.index]
 if len(features) > 20:
     X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2, shuffle=False)
