@@ -23,10 +23,14 @@ def plot_with_tooltips(df):
     # Wykres ceny zamknięcia
     line, = ax.plot(df["Date"], df["Close"], marker="o", linestyle="-", color="b", label="Close")
 
+    # Upewniamy się, że kolumna Date jest typu datetime
+    df["Date"] = pd.to_datetime(df["Date"])
+
     # Przygotowanie etykiet tooltipów
     labels = []
     for i, row in df.iterrows():
         labels.append(f"<b>{row['Date'].strftime('%Y-%m-%d')}</b><br>Cena: {row['Close']:.2f}")
+
 
     # Dodanie tooltipów do punktów
     tooltip = plugins.PointHTMLTooltip(line, labels, voffset=10, hoffset=10)
