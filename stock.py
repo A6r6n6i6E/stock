@@ -1,7 +1,6 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 import mpld3
 from mpld3 import plugins
@@ -18,21 +17,25 @@ def load_data(symbol, period="6mo", interval="1d"):
 # Funkcja rysująca wykres z tooltipami
 # =====================
 def plot_with_tooltips(df):
-    # Upewniamy się, że Date jest datetime
+    # Konwersja typów
     df["Date"] = pd.to_datetime(df["Date"], errors='coerce')
-
-    # Upewniamy się, że Close jest float
     df["Close"] = pd.to_numeric(df["Close"], errors='coerce')
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    scatter = ax.scatter(df["Date"], df["Close"], c='blue', s=20)
+    # Usuwamy wiersze z brakami danych
+    df = df.dropna(subset=["Date", "Close"])
 
-    # Tworzymy tooltipy
-    labels = []
-    for i, row in df.iterrows():
-        date_str = row["Date"].strftime('%Y-%m-%d') if not pd.isnull(row["Date"]) else "Brak daty"
-        close_val = f"{row['Close']:.2f}" if not pd.isnull(row["Close"]) else "Brak danych"
-        labels.append(f"<b>{date_str}</b><br>Cena: {close_val}")
+    # Zamiana na numpy array (mpld3 tego wymaga)
+    dates = df["Date"].to_numpy()
+    closes = df["Close"].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    scatter = ax.scatter(dates, closes, c='blue', s=20)
+
+    # Tooltipy
+    labels = [
+        f"<b>{d.strftime('%Y-%m-%d')}</b><br>Cena: {c:.2f}"
+        for d, c in zip(dates, closes)
+    ]
 
     tooltip = plugins.PointHTMLTooltip(scatter, labels, voffset=10, hoffset=10)
     plugins.connect(fig, tooltip)
