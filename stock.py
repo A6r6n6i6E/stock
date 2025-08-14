@@ -90,6 +90,34 @@ def flatten_columns(df):
         df.columns = [str(col).upper() for col in df.columns]
     return df
 
+def find_ohlc_columns(df):
+    """Znajdź kolumny OHLC niezależnie od formatowania"""
+    cols = {}
+    
+    # Możliwe nazwy kolumn
+    possible_names = {
+        'OPEN': ['OPEN', 'Open', 'open'],
+        'HIGH': ['HIGH', 'High', 'high'], 
+        'LOW': ['LOW', 'Low', 'low'],
+        'CLOSE': ['CLOSE', 'Close', 'close'],
+        'VOLUME': ['VOLUME', 'Volume', 'volume']
+    }
+    
+    for key, possible in possible_names.items():
+        found = False
+        for col_name in df.columns:
+            for poss in possible:
+                if poss in col_name:
+                    cols[key] = col_name
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            cols[key] = None
+    
+    return cols
+
 @st.cache_data(ttl=300)  # Cache na 5 minut
 def load_data(symbol, period, interval):
     try:
@@ -142,9 +170,15 @@ def create_features(df):
             features.append(f'{indicator}_TREND')
     
     # Relative position indicators
-    if 'CLOSE' in df.columns:
+    close_col = None
+    for col in df.columns:
+        if 'CLOSE' in col.upper():
+            close_col = col
+            break
+    
+    if close_col:
         for period in [5, 10, 20]:
-            df[f'CLOSE_VS_MA{period}'] = df['CLOSE'] / df['CLOSE'].rolling(period).mean() - 1
+            df[f'CLOSE_VS_MA{period}'] = df[close_col] / df[close_col].rolling(period).mean() - 1
             features.append(f'CLOSE_VS_MA{period}')
     
     return features
@@ -278,6 +312,16 @@ def main():
         return
     
     df = df.tail(num_sessions)
+    
+    # Znajdź kolumny OHLC
+    ohlc_cols = find_ohlc_columns(df)
+    
+    # Sprawdź czy mamy wszystkie wymagane kolumny
+    missing_cols = [k for k, v in ohlc_cols.items() if v is None and k in ['OPEN', 'HIGH', 'LOW', 'CLOSE']]
+    if missing_cols:
+        st.error(f"❌ Brak wymaganych kolumn: {missing_cols}")
+        st.info("Dostępne kolumny: " + ", ".join(df.columns.tolist()))
+        return
     
     # Trenowanie modelu ML
     ml_model, scaler, features, accuracy = None, None, [], 0
