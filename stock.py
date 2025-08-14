@@ -250,6 +250,9 @@ def train_ml_model(df):
         features = create_features(df)
         target = create_target(df)
         
+        if len(target) == 0:
+            return None, None, [], 0
+        
         # Usuń wiersze z brakującymi danymi
         feature_data = df[features].fillna(method='ffill').fillna(method='bfill')
         valid_idx = ~np.isnan(target)
@@ -258,7 +261,7 @@ def train_ml_model(df):
         y = target[valid_idx]
         
         if len(X) < 50:  # Za mało danych
-            return None, None, []
+            return None, None, [], 0
         
         # Podział danych
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -372,19 +375,30 @@ def main():
     col1, col2 = st.columns([2, 1])
     
     with st.spinner(f"Ładowanie danych dla {ticker}..."):
-        df = load_data(symbol, period, interval)
+        result = load_data(symbol, period, interval)
+        if isinstance(result, tuple):
+            df, error_msg = result
+        else:
+            df = result
+            error_msg = None
     
+    if error_msg:
+        st.error(f"❌ {error_msg}")
+        return
+        
     if df.empty:
-        st.error("❌ Brak danych dla wybranego zakresu")
+        st.error("❌ Otrzymano puste dane")
         return
     
     df = df.tail(num_sessions)
     
-    # Znajdź kolumny OHLC
+    # Znajdź kolumny OHLC ponownie po obcięciu danych
     ohlc_cols = find_ohlc_columns(df)
+    st.write("🔍 **Debug - Finalne kolumny OHLC:**", ohlc_cols)
     
     # Sprawdź czy mamy wszystkie wymagane kolumny
-    missing_cols = [k for k, v in ohlc_cols.items() if v is None and k in ['OPEN', 'HIGH', 'LOW', 'CLOSE']]
+    required_cols = ['OPEN', 'HIGH', 'LOW', 'CLOSE']
+    missing_cols = [k for k in required_cols if ohlc_cols.get(k) is None]
     if missing_cols:
         st.error(f"❌ Brak wymaganych kolumn: {missing_cols}")
         st.info("Dostępne kolumny: " + ", ".join(df.columns.tolist()))
