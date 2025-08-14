@@ -1,390 +1,472 @@
-# app.py
-# ============================================
-# WIG20 AI Trader — mobilna aplikacja inwestycyjna (Streamlit)
-# ============================================
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import plotly.graph_objs as go
 import numpy as np
-import plotly.graph_objects as go
 import pandas_ta as ta
+from scipy.signal import argrelextrema
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+import warnings
+warnings.filterwarnings('ignore')
 
-# ------------------------------
-# KONFIGURACJA STRONY + STYL
-# ------------------------------
+# Konfiguracja strony z lepszym layoutem mobilnym
 st.set_page_config(
-    page_title="WIG20 AI Trader",
-    page_icon="📈",
+    page_title="📈 WIG20 Trading Assistant",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded"
 )
 
-MOBILE_CSS = """
+# Custom CSS dla lepszego wyglądu na mobile
+st.markdown("""
 <style>
-/* większe klikacze na mobile */
-@media (max-width: 820px) {
-  .stPlotlyChart { height: 68vh !important; }
-  .stButton button, .stDownloadButton button {
-    font-size: 18px !important; padding: 14px 22px !important; border-radius: 12px !important;
-  }
-  .stSelectbox div[data-baseweb="select"] { font-size: 18px !important; }
-  .block-container { padding-top: 0.6rem; }
-}
-/* status pills */
-.pill { display:inline-block; padding:6px 12px; border-radius:999px; font-weight:600; }
-.pill-buy { background:#10b98122; color:#059669; border:1px solid #10b98155;}
-.pill-sell{ background:#ef444422; color:#b91c1c; border:1px solid #ef444455;}
-.pill-neutral{ background:#6b728022; color:#374151; border:1px solid #6b728055;}
-/* nagłówek sekcji */
-h3 span.kicker { font-size:0.85rem; font-weight:600; opacity:0.7; margin-left:.25rem;}
-/* tabele kompaktowe */
-table td, table th { padding: 6px 8px !important; }
-</style>
-"""
-st.markdown(MOBILE_CSS, unsafe_allow_html=True)
-
-# ------------------------------
-# SŁOWNIK WIG20
-# ------------------------------
-wig20_dict = {
-    "ALIOR": "ALR.WA", "ALLEGRO": "ALE.WA", "BUDIMEX": "BDX.WA", "CCC": "CCC.WA",
-    "CDPROJEKT": "CDR.WA", "DINOPL": "DNP.WA", "KETY": "KTY.WA", "KGHM": "KGH.WA",
-    "KRUK": "KRK.WA", "LPP": "LPP.WA", "MBANK": "MBK.WA", "ORANGEPL": "OPL.WA",
-    "PEKAO": "PEO.WA", "PEPCO": "PCO.WA", "PGE": "PGE.WA", "PKNORLEN": "PKN.WA",
-    "PKOBP": "PKO.WA", "PZU": "PZU.WA", "SANPL": "SAN.WA", "ZABKA": "ZAB.WA"
-}
-
-# ------------------------------
-# SIDEBAR (ustawienia)
-# ------------------------------
-with st.sidebar:
-    st.title("⚙️ Ustawienia")
-    ticker = st.selectbox("Spółka WIG20", list(wig20_dict.keys()), index=15)  # PKN domyślnie
-    symbol = wig20_dict[ticker]
-    col1, col2 = st.columns(2)
-    with col1:
-        period = st.selectbox("Zakres", ["3mo", "6mo", "1y", "2y", "5y"], index=2)
-    with col2:
-        interval = st.selectbox("Interwał", ["1d", "1h"], index=0)
-    num_rows = st.slider("Ile ostatnich świec", 50, 600, 200, step=10)
-    st.caption("Wskazówki: RSI(14), SMA(50/200), MACD(12,26,9) • Sygnały: SMA×RSI×MACD")
-
-# ------------------------------
-# FUNKCJE POMOCNICZE
-# ------------------------------
-def _std_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Ujednolica nazwy kolumn (UPPER + bez spacji)."""
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join([str(i) for i in col if i]).upper().replace(" ", "_") for col in df.columns]
-    else:
-        df.columns = [str(c).upper().replace(" ", "_") for c in df.columns]
-    return df
-
-@st.cache_data(ttl=3600)
-def load_ohlc(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = _std_cols(df.reset_index())
-    # Gwarantujemy CLOSE:
-    if "CLOSE" not in df.columns:
-        # yfinance zawsze zwraca Close, ale dla pewności:
-        close_candidates = [c for c in df.columns if "CLOSE" in c]
-        if not close_candidates:
-            return pd.DataFrame()
-        df["CLOSE"] = df[close_candidates[0]]
-    # Indykatory na jawnie wskazanym CLOSE -> stałe nazwy kolumn!
-    df.ta.sma(close=df["CLOSE"], length=50, append=True)     # SMA_50
-    df.ta.sma(close=df["CLOSE"], length=200, append=True)    # SMA_200
-    df.ta.rsi(close=df["CLOSE"], length=14, append=True)     # RSI_14
-    df.ta.macd(close=df["CLOSE"], append=True)               # MACD_12_26_9, MACDs_12_26_9, MACDh_12_26_9
-    return df
-
-def build_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """Zwraca DataFrame z kolumną 'SIGNAL' (BUY/SELL/NEUTRAL) i pomocniczymi sygnałami."""
-    req = {"SMA_50", "SMA_200", "RSI_14", "MACD_12_26_9", "MACDs_12_26_9", "CLOSE"}
-    if not req.issubset(set(df.columns)):
-        return pd.DataFrame()
-
-    # Crossover SMA50/200
-    sma_cross_up = (df["SMA_50"] > df["SMA_200"]) & (df["SMA_50"].shift(1) <= df["SMA_200"].shift(1))
-    sma_cross_dn = (df["SMA_50"] < df["SMA_200"]) & (df["SMA_50"].shift(1) >= df["SMA_200"].shift(1))
-
-    # Filtry RSI i MACD
-    rsi_buy = df["RSI_14"] < 30
-    rsi_sell = df["RSI_14"] > 70
-    macd_buy = df["MACD_12_26_9"] > df["MACDs_12_26_9"]
-    macd_sell = df["MACD_12_26_9"] < df["MACDs_12_26_9"]
-
-    final_buy = (sma_cross_up & rsi_buy & macd_buy)
-    final_sell = (sma_cross_dn & rsi_sell & macd_sell)
-
-    out = df.copy()
-    out["BUY"] = final_buy.astype(int)
-    out["SELL"] = final_sell.astype(int)
-    out["SIGNAL"] = np.where(final_buy, "BUY", np.where(final_sell, "SELL", "NEUTRAL"))
-    return out
-
-def make_candles(df: pd.DataFrame, title: str) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df["DATE"] if "DATE" in df.columns else df.index,
-        open=df["OPEN"], high=df["HIGH"], low=df["LOW"], close=df["CLOSE"],
-        name="Świece",
-        increasing_line_color="green",
-        decreasing_line_color="red",
-    ))
-    if "SMA_50" in df and "SMA_200" in df:
-        fig.add_trace(go.Scatter(x=df["DATE"], y=df["SMA_50"], mode="lines", name="SMA 50",
-                                 line=dict(width=2)))
-        fig.add_trace(go.Scatter(x=df["DATE"], y=df["SMA_200"], mode="lines", name="SMA 200",
-                                 line=dict(width=2)))
-    fig.update_layout(
-        title=title, xaxis_title="Data", yaxis_title="Cena",
-        xaxis_rangeslider_visible=False, height=600, margin=dict(l=10, r=10, t=60, b=10)
-    )
-    return fig
-
-def add_markers(fig: go.Figure, df_sig: pd.DataFrame):
-    buy_pts = df_sig[df_sig["BUY"] == 1]
-    sell_pts = df_sig[df_sig["SELL"] == 1]
-    if not buy_pts.empty:
-        fig.add_trace(go.Scatter(
-            x=buy_pts["DATE"], y=buy_pts["CLOSE"],
-            mode="markers", name="Kupno",
-            marker=dict(symbol="triangle-up", size=14)
-        ))
-    if not sell_pts.empty:
-        fig.add_trace(go.Scatter(
-            x=sell_pts["DATE"], y=sell_pts["CLOSE"],
-            mode="markers", name="Sprzedaż",
-            marker=dict(symbol="triangle-down", size=14)
-        ))
-
-def last_signal_badge(df_sig: pd.DataFrame):
-    last_row = df_sig.iloc[-1]
-    lab = last_row["SIGNAL"]
-    price = last_row["CLOSE"]
-    date = pd.to_datetime(last_row["DATE"]).date() if "DATE" in df_sig else df_sig.index[-1].date()
-    if lab == "BUY":
-        st.markdown(f'<span class="pill pill-buy">🟢 KUPNO</span> &nbsp; {date} @ {price:.2f} zł', unsafe_allow_html=True)
-    elif lab == "SELL":
-        st.markdown(f'<span class="pill pill-sell">🔴 SPRZEDAŻ</span> &nbsp; {date} @ {price:.2f} zł', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<span class="pill pill-neutral">⚪ NEUTRAL</span> &nbsp; {date} @ {price:.2f} zł', unsafe_allow_html=True)
-
-def quick_backtest(df_sig: pd.DataFrame) -> dict:
-    """Bardzo prosty backtest: BUY -> long do SELL; SELL -> cash. Brak kosztów/poślizgu."""
-    if df_sig.empty:
-        return {"trades": 0, "return": 0.0, "buy_hold": 0.0}
-    prices = df_sig["CLOSE"].values
-    signals = df_sig["SIGNAL"].values
-    pos = 0  # 1 long, 0 cash
-    entry_price = None
-    equity = 1.0
-    peak = 1.0
-    max_dd = 0.0
-    trades = 0
-
-    for i in range(1, len(prices)):
-        if signals[i-1] == "BUY" and pos == 0:
-            pos = 1
-            entry_price = prices[i]
-            trades += 1
-        elif signals[i-1] == "SELL" and pos == 1:
-            # zamknięcie long
-            ret = prices[i] / entry_price
-            equity *= ret
-            pos = 0
-            entry_price = None
-        # equity trail (jeśli otwarta pozycja, mark-to-market)
-        if pos == 1 and entry_price:
-            mtm = (prices[i] / entry_price)
-            eq_inst = equity * mtm
-        else:
-            eq_inst = equity
-        peak = max(peak, eq_inst)
-        max_dd = min(max_dd, (eq_inst / peak) - 1.0)
-
-    # domknięcie pozycji na końcu:
-    if pos == 1 and entry_price:
-        equity *= prices[-1] / entry_price
-
-    bh = prices[-1] / prices[0]  # buy&hold
-    return {
-        "trades": trades,
-        "return": equity - 1.0,
-        "buy_hold": bh - 1.0,
-        "max_drawdown": max_dd
+    .stSelectbox > div > div > select {
+        font-size: 16px;
     }
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f77b4;
+        margin: 0.5rem 0;
+    }
+    .buy-signal {
+        color: #00C851;
+        font-weight: bold;
+        font-size: 18px;
+    }
+    .sell-signal {
+        color: #FF4444;
+        font-weight: bold;
+        font-size: 18px;
+    }
+    .hold-signal {
+        color: #FF8800;
+        font-weight: bold;
+        font-size: 18px;
+    }
+    .signal-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+        text-align: center;
+    }
+    .buy-box { background-color: #d4edda; border: 2px solid #00C851; }
+    .sell-box { background-color: #f8d7da; border: 2px solid #FF4444; }
+    .hold-box { background-color: #fff3cd; border: 2px solid #FF8800; }
+</style>
+""", unsafe_allow_html=True)
 
-def ai_forecast(df: pd.DataFrame) -> dict:
-    """RandomForest: prognoza, pewność, trafność testowa, ważność cech."""
-    need = ["SMA_50", "SMA_200", "RSI_14", "MACD_12_26_9", "MACDs_12_26_9", "CLOSE"]
-    if not set(need).issubset(df.columns):
-        return {}
-    features = df[["SMA_50", "SMA_200", "RSI_14", "MACD_12_26_9", "MACDs_12_26_9"]].copy()
-    # cel: wzrost jutro?
-    target = (df["CLOSE"].shift(-1) > df["CLOSE"]).astype(int)
-    data = pd.concat([features, target.rename("TARGET")], axis=1).dropna()
-    if len(data) < 80:
-        return {}
+# Słownik spółek WIG20
+wig20_dict = {
+    "ALIOR": "ALR.WA",
+    "ALLEGRO": "ALE.WA", 
+    "BUDIMEX": "BDX.WA",
+    "CCC": "CCC.WA",
+    "CDPROJEKT": "CDR.WA",
+    "DINOPL": "DNP.WA",
+    "KETY": "KTY.WA",
+    "KGHM": "KGH.WA",
+    "KRUK": "KRK.WA",
+    "LPP": "LPP.WA",
+    "MBANK": "MBK.WA",
+    "ORANGEPL": "OPL.WA",
+    "PEKAO": "PEO.WA",
+    "PEPCO": "PCO.WA",
+    "PGE": "PGE.WA",
+    "PKNORLEN": "PKN.WA",
+    "PKOBP": "PKO.WA",
+    "PZU": "PZU.WA",
+    "SANPL": "SAN.WA",
+    "ZABKA": "ZAB.WA"
+}
 
-    X = data.drop(columns=["TARGET"])
-    y = data["TARGET"]
-
-    # nie mieszamy — zachowujemy kolejność czasową
-    split = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
-
-    model = RandomForestClassifier(n_estimators=200, random_state=42)
-    model.fit(X_train, y_train)
-
-    acc = float((model.predict(X_test) == y_test).mean())
-    last_x = X.iloc[[-1]]
-    proba = model.predict_proba(last_x)[0][1]
-    pred = int(proba >= 0.5)
-
-    importances = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
-    return {"pred": pred, "proba": proba, "acc": acc, "importances": importances}
-
-# ------------------------------
-# DANE + OBRÓBKA
-# ------------------------------
-df_raw = load_ohlc(wig20_dict[ticker], period, interval)
-if df_raw.empty:
-    st.error("❌ Brak danych (ticker/zakres/interwał). Spróbuj innej konfiguracji.")
-    st.stop()
-
-df = df_raw.tail(max(num_rows, 60)).copy()
-df_sig = build_signals(df)
-if df_sig.empty:
-    st.error("❌ Nie udało się obliczyć wskaźników/sygnałów.")
-    st.stop()
-
-# ------------------------------
-# NAGŁÓWEK
-# ------------------------------
-left, right = st.columns([0.7, 0.3])
-with left:
-    st.subheader(f"📊 {ticker}  ({wig20_dict[ticker]})")
-    last_signal_badge(df_sig)
-with right:
-    st.write("")
-    st.caption("Informacyjnie — to nie jest porada inwestycyjna.")
-
-# ------------------------------
-# ZAKŁADKI
-# ------------------------------
-tab_chart, tab_signals, tab_ai, tab_screener = st.tabs(["📈 Wykres", "🔔 Sygnały", "🤖 AI", "🧭 Skaner WIG20"])
-
-# --- Wykres ---
-with tab_chart:
-    show_markers = st.toggle("Pokaż markery sygnałów na wykresie", value=True)
-    fig = make_candles(df, f"Notowania {ticker}")
-    if show_markers:
-        add_markers(fig, df_sig)
-    st.plotly_chart(fig, use_container_width=True)
-
-    # RSI wykres
-    if "RSI_14" in df:
-        fig_rsi = go.Figure()
-        fig_rsi.add_trace(go.Scatter(x=df["DATE"], y=df["RSI_14"], mode="lines", name="RSI 14"))
-        fig_rsi.add_hline(y=30, line_dash="dash")
-        fig_rsi.add_hline(y=70, line_dash="dash")
-        fig_rsi.update_layout(title="RSI (14)", height=260, xaxis_rangeslider_visible=False, margin=dict(l=10,r=10,t=50,b=10))
-        st.plotly_chart(fig_rsi, use_container_width=True)
-
-    # szybki backtest
-    bt = quick_backtest(df_sig)
-    colb1, colb2, colb3, colb4 = st.columns(4)
-    colb1.metric("Transakcji", bt["trades"])
-    colb2.metric("Stopa zwrotu strategii", f"{bt['return']*100:0.1f}%")
-    colb3.metric("Buy&Hold (ten sam okres)", f"{bt['buy_hold']*100:0.1f}%")
-    colb4.metric("Max Drawdown", f"{bt['max_drawdown']*100:0.1f}%")
-
-# --- Sygnały ---
-with tab_signals:
-    st.markdown("### Ostatnie sygnały")
-    sig_rows = df_sig[df_sig["SIGNAL"].isin(["BUY", "SELL"])].copy()
-    sig_rows = sig_rows[["DATE", "CLOSE", "SIGNAL"]].tail(20)
-    if sig_rows.empty:
-        st.info("Brak świeżych sygnałów w wybranym oknie.")
+def flatten_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join([str(i) for i in col if i]).upper() for col in df.columns]
     else:
-        # kolorowe znaczniki
-        sig_rows["STATUS"] = sig_rows["SIGNAL"].map({
-            "BUY": "🟢 BUY",
-            "SELL": "🔴 SELL",
-            "NEUTRAL": "⚪ NEUTRAL"
-        })
-        sig_rows = sig_rows[["DATE", "CLOSE", "STATUS"]].rename(columns={"DATE":"Data", "CLOSE":"Kurs", "STATUS":"Sygnał"})
-        st.dataframe(sig_rows, use_container_width=True, hide_index=True)
+        df.columns = [str(col).upper() for col in df.columns]
+    return df
 
-# --- AI ---
-with tab_ai:
-    st.markdown("### Prognoza AI na jutro")
-    res = ai_forecast(df)
-    if not res:
-        st.warning("Za mało danych do wiarygodnej prognozy AI. Zwiększ zakres lub zmień interwał.")
+@st.cache_data(ttl=300)  # Cache na 5 minut
+def load_data(symbol, period, interval):
+    try:
+        df = yf.download(symbol, period=period, interval=interval)
+        if df.empty:
+            return df
+        
+        df = flatten_columns(df)
+        
+        # Wskaźniki techniczne
+        df.ta.sma(length=20, append=True)
+        df.ta.sma(length=50, append=True)
+        df.ta.sma(length=200, append=True)
+        df.ta.ema(length=12, append=True)
+        df.ta.ema(length=26, append=True)
+        df.ta.bbands(length=20, std=2, append=True)
+        df.ta.rsi(length=14, append=True)
+        df.ta.macd(append=True)
+        df.ta.stoch(append=True)
+        df.ta.adx(append=True)
+        df.ta.cci(append=True)
+        df.ta.willr(append=True)
+        
+        # Dodatkowe cechy dla ML
+        df['PRICE_CHANGE'] = df['CLOSE'].pct_change()
+        df['VOLUME_MA'] = df['VOLUME'].rolling(20).mean()
+        df['VOLUME_RATIO'] = df['VOLUME'] / df['VOLUME_MA']
+        df['HIGH_LOW_PCT'] = (df['HIGH'] - df['LOW']) / df['CLOSE']
+        df['CLOSE_OPEN_PCT'] = (df['CLOSE'] - df['OPEN']) / df['OPEN']
+        
+        return df
+    except Exception as e:
+        st.error(f"Błąd podczas pobierania danych: {e}")
+        return pd.DataFrame()
+
+def create_features(df):
+    """Tworzenie cech dla modelu ML"""
+    features = []
+    
+    # Lista wskaźników do wykorzystania
+    indicators = ['SMA_20', 'SMA_50', 'EMA_12', 'EMA_26', 'RSI_14', 'MACD_12_26_9', 
+                 'STOCHk_14_3_3', 'STOCHd_14_3_3', 'ADX_14', 'CCI_14_0.015', 
+                 'WILLR_14', 'VOLUME_RATIO', 'HIGH_LOW_PCT', 'CLOSE_OPEN_PCT']
+    
+    for indicator in indicators:
+        if indicator in df.columns:
+            features.append(indicator)
+            # Dodaj trend wskaźnika
+            df[f'{indicator}_TREND'] = np.where(df[indicator] > df[indicator].shift(1), 1, -1)
+            features.append(f'{indicator}_TREND')
+    
+    # Relative position indicators
+    if 'CLOSE' in df.columns:
+        for period in [5, 10, 20]:
+            df[f'CLOSE_VS_MA{period}'] = df['CLOSE'] / df['CLOSE'].rolling(period).mean() - 1
+            features.append(f'CLOSE_VS_MA{period}')
+    
+    return features
+
+def create_target(df, forward_days=5, threshold=0.02):
+    """Tworzenie zmiennej docelowej - czy cena wzrośnie o threshold% w ciągu forward_days"""
+    future_return = df['CLOSE'].shift(-forward_days) / df['CLOSE'] - 1
+    target = np.where(future_return > threshold, 2,  # Strong Buy
+                     np.where(future_return < -threshold, 0, 1))  # Sell, Hold, Buy
+    return target
+
+def train_ml_model(df):
+    """Trenowanie modelu ML"""
+    try:
+        features = create_features(df)
+        target = create_target(df)
+        
+        # Usuń wiersze z brakującymi danymi
+        feature_data = df[features].fillna(method='ffill').fillna(method='bfill')
+        valid_idx = ~np.isnan(target)
+        
+        X = feature_data[valid_idx]
+        y = target[valid_idx]
+        
+        if len(X) < 50:  # Za mało danych
+            return None, None, []
+        
+        # Podział danych
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Skalowanie
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Trenowanie modelu
+        model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10)
+        model.fit(X_train_scaled, y_train)
+        
+        # Predykcja
+        y_pred = model.predict(X_test_scaled)
+        accuracy = accuracy_score(y_test, y_pred)
+        
+        return model, scaler, features, accuracy
+        
+    except Exception as e:
+        st.error(f"Błąd podczas trenowania modelu: {e}")
+        return None, None, [], 0
+
+def get_ml_signal(df, model, scaler, features):
+    """Pobieranie sygnału z modelu ML"""
+    try:
+        if model is None or len(df) == 0:
+            return "HOLD", 0.33
+        
+        latest_data = df[features].iloc[-1:].fillna(method='ffill').fillna(0)
+        latest_scaled = scaler.transform(latest_data)
+        
+        prediction = model.predict(latest_scaled)[0]
+        probabilities = model.predict_proba(latest_scaled)[0]
+        
+        signals = {0: "SELL", 1: "HOLD", 2: "BUY"}
+        confidence = max(probabilities)
+        
+        return signals[prediction], confidence
+        
+    except Exception as e:
+        return "HOLD", 0.33
+
+def calculate_traditional_signals(df):
+    """Obliczanie tradycyjnych sygnałów technicznych"""
+    signals = {"RSI": "HOLD", "MACD": "HOLD", "SMA": "HOLD", "Bollinger": "HOLD"}
+    
+    if 'RSI_14' in df.columns and not df['RSI_14'].isna().all():
+        latest_rsi = df['RSI_14'].iloc[-1]
+        if latest_rsi < 30:
+            signals["RSI"] = "BUY"
+        elif latest_rsi > 70:
+            signals["RSI"] = "SELL"
+    
+    if 'MACD_12_26_9' in df.columns and 'MACDs_12_26_9' in df.columns:
+        latest_macd = df['MACD_12_26_9'].iloc[-1]
+        latest_signal = df['MACDs_12_26_9'].iloc[-1]
+        if latest_macd > latest_signal:
+            signals["MACD"] = "BUY"
+        else:
+            signals["MACD"] = "SELL"
+    
+    if 'SMA_50' in df.columns and 'SMA_200' in df.columns:
+        if df['SMA_50'].iloc[-1] > df['SMA_200'].iloc[-1]:
+            signals["SMA"] = "BUY"
+        else:
+            signals["SMA"] = "SELL"
+    
+    if 'BBL_20_2.0' in df.columns and 'BBU_20_2.0' in df.columns and 'CLOSE' in df.columns:
+        close = df['CLOSE'].iloc[-1]
+        bb_lower = df['BBL_20_2.0'].iloc[-1]
+        bb_upper = df['BBU_20_2.0'].iloc[-1]
+        
+        if close <= bb_lower:
+            signals["Bollinger"] = "BUY"
+        elif close >= bb_upper:
+            signals["Bollinger"] = "SELL"
+    
+    return signals
+
+def main():
+    st.title("📈 WIG20 Trading Assistant z AI")
+    st.markdown("*Analiza techniczna z wykorzystaniem Machine Learning*")
+    
+    # Sidebar - kompaktowy dla mobile
+    with st.sidebar:
+        st.header("⚙️ Ustawienia")
+        ticker = st.selectbox("🏢 Spółka WIG20", list(wig20_dict.keys()))
+        symbol = wig20_dict[ticker]
+        
+        period = st.selectbox("📅 Zakres", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+        interval = st.selectbox("⏱️ Interwał", ["1d", "1h"], index=0)
+        num_sessions = st.slider("📊 Liczba sesji", 50, 500, 200)
+        
+        use_ml = st.checkbox("🤖 Włącz AI/ML", value=True)
+    
+    # Główna część aplikacji
+    col1, col2 = st.columns([2, 1])
+    
+    with st.spinner(f"Ładowanie danych dla {ticker}..."):
+        df = load_data(symbol, period, interval)
+    
+    if df.empty:
+        st.error("❌ Brak danych dla wybranego zakresu")
+        return
+    
+    df = df.tail(num_sessions)
+    
+    # Trenowanie modelu ML
+    ml_model, scaler, features, accuracy = None, None, [], 0
+    if use_ml:
+        with st.spinner("Trenowanie modelu AI..."):
+            ml_model, scaler, features, accuracy = train_ml_model(df)
+    
+    # Sygnały
+    traditional_signals = calculate_traditional_signals(df)
+    ml_signal, ml_confidence = get_ml_signal(df, ml_model, scaler, features) if use_ml else ("HOLD", 0.33)
+    
+    # Główny sygnał (kombinacja)
+    buy_votes = sum(1 for signal in traditional_signals.values() if signal == "BUY")
+    sell_votes = sum(1 for signal in traditional_signals.values() if signal == "SELL")
+    
+    if use_ml and ml_signal == "BUY" and ml_confidence > 0.6:
+        buy_votes += 2
+    elif use_ml and ml_signal == "SELL" and ml_confidence > 0.6:
+        sell_votes += 2
+    
+    if buy_votes > sell_votes and buy_votes >= 2:
+        main_signal = "BUY"
+        signal_class = "buy-box"
+        signal_emoji = "🟢"
+    elif sell_votes > buy_votes and sell_votes >= 2:
+        main_signal = "SELL"
+        signal_class = "sell-box"
+        signal_emoji = "🔴"
     else:
-        pred_txt = "📈 **Wzrost**" if res["pred"] == 1 else "📉 **Spadek**"
-        colA, colB, colC = st.columns(3)
-        colA.metric("Prognoza", pred_txt)
-        colB.metric("Pewność modelu", f"{res['proba']*100:0.1f}%")
-        colC.metric("Trafność (test)", f"{res['acc']*100:0.1f}%")
+        main_signal = "HOLD"
+        signal_class = "hold-box"
+        signal_emoji = "🟡"
+    
+    # Wyświetlanie głównego sygnału
+    st.markdown(f"""
+    <div class="signal-box {signal_class}">
+        <h2>{signal_emoji} GŁÓWNY SYGNAŁ: {main_signal}</h2>
+        <p>Aktualna cena: <strong>{df['CLOSE'].iloc[-1]:.2f} PLN</strong></p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Szczegóły sygnałów
+    with col2:
+        st.subheader("🔍 Analiza sygnałów")
+        
+        # Tradycyjne sygnały
+        for indicator, signal in traditional_signals.items():
+            color = "#00C851" if signal == "BUY" else "#FF4444" if signal == "SELL" else "#FF8800"
+            st.markdown(f"**{indicator}**: <span style='color: {color}'>{signal}</span>", unsafe_allow_html=True)
+        
+        # Sygnał ML
+        if use_ml and ml_model is not None:
+            st.markdown("---")
+            st.subheader("🤖 Sygnał AI")
+            color = "#00C851" if ml_signal == "BUY" else "#FF4444" if ml_signal == "SELL" else "#FF8800"
+            st.markdown(f"**Predykcja**: <span style='color: {color}'>{ml_signal}</span>", unsafe_allow_html=True)
+            st.progress(ml_confidence)
+            st.caption(f"Pewność: {ml_confidence:.1%}")
+            if accuracy > 0:
+                st.caption(f"Dokładność modelu: {accuracy:.1%}")
+    
+    # Wykres główny
+    with col1:
+        fig_price = go.Figure()
+        
+        # Świece
+        fig_price.add_trace(go.Candlestick(
+            x=df.index,
+            open=df['OPEN'],
+            high=df['HIGH'],
+            low=df['LOW'],
+            close=df['CLOSE'],
+            increasing_line_color='#00C851',
+            decreasing_line_color='#FF4444',
+            name='Cena'
+        ))
+        
+        # Średnie kroczące
+        if 'SMA_20' in df.columns:
+            fig_price.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], 
+                                         mode='lines', name='SMA 20', 
+                                         line=dict(color='orange', width=1)))
+        
+        if 'SMA_50' in df.columns:
+            fig_price.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], 
+                                         mode='lines', name='SMA 50', 
+                                         line=dict(color='blue', width=2)))
+        
+        if 'SMA_200' in df.columns:
+            fig_price.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], 
+                                         mode='lines', name='SMA 200', 
+                                         line=dict(color='purple', width=2)))
+        
+        # Bollinger Bands
+        if 'BBU_20_2.0' in df.columns and 'BBL_20_2.0' in df.columns:
+            fig_price.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], 
+                                         mode='lines', name='BB Upper', 
+                                         line=dict(color='gray', dash='dash')))
+            fig_price.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], 
+                                         mode='lines', name='BB Lower', 
+                                         line=dict(color='gray', dash='dash')))
+        
+        fig_price.update_layout(
+            title=f"{ticker} ({symbol}) - Analiza techniczna",
+            xaxis_title="Data",
+            yaxis_title="Cena (PLN)",
+            height=500,
+            xaxis_rangeslider_visible=False,
+            showlegend=True
+        )
+        
+        st.plotly_chart(fig_price, use_container_width=True)
+    
+    # Wskaźniki oscylatorów
+    col3, col4 = st.columns(2)
+    
+    with col3:
+        if 'RSI_14' in df.columns:
+            fig_rsi = go.Figure()
+            fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI_14'], 
+                                       mode='lines', name='RSI 14', 
+                                       line=dict(color='purple')))
+            fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
+            fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
+            fig_rsi.update_layout(title="RSI", height=300, 
+                                yaxis=dict(range=[0, 100]))
+            st.plotly_chart(fig_rsi, use_container_width=True)
+    
+    with col4:
+        if 'MACD_12_26_9' in df.columns and 'MACDs_12_26_9' in df.columns:
+            fig_macd = go.Figure()
+            fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACD_12_26_9'], 
+                                        mode='lines', name='MACD'))
+            fig_macd.add_trace(go.Scatter(x=df.index, y=df['MACDs_12_26_9'], 
+                                        mode='lines', name='Signal'))
+            fig_macd.update_layout(title="MACD", height=300)
+            st.plotly_chart(fig_macd, use_container_width=True)
+    
+    # Podsumowanie i rekomendacje
+    st.subheader("📋 Podsumowanie i rekomendacje")
+    
+    current_price = df['CLOSE'].iloc[-1]
+    price_change = df['PRICE_CHANGE'].iloc[-1] * 100 if 'PRICE_CHANGE' in df.columns else 0
+    
+    col5, col6, col7 = st.columns(3)
+    
+    with col5:
+        st.metric("Aktualna cena", f"{current_price:.2f} PLN", 
+                 f"{price_change:+.2f}%")
+    
+    with col6:
+        volume = df['VOLUME'].iloc[-1] if 'VOLUME' in df.columns else 0
+        st.metric("Wolumen", f"{volume:,.0f}")
+    
+    with col7:
+        if 'RSI_14' in df.columns:
+            rsi_value = df['RSI_14'].iloc[-1]
+            st.metric("RSI", f"{rsi_value:.1f}")
+    
+    # Instrukcje handlowe
+    if main_signal == "BUY":
+        st.success("""
+        🟢 **SYGNAŁ KUPNA**
+        - Rozważ otwarcie pozycji długiej
+        - Ustaw stop-loss 2-3% poniżej aktualnej ceny
+        - Cele: kolejne poziomy oporu
+        """)
+    elif main_signal == "SELL":
+        st.error("""
+        🔴 **SYGNAŁ SPRZEDAŻY**
+        - Rozważ zamknięcie pozycji długiej lub otwarcie krótkiej
+        - Ustaw stop-loss 2-3% powyżej aktualnej ceny
+        - Cele: kolejne poziomy wsparcia
+        """)
+    else:
+        st.warning("""
+        🟡 **SYGNAŁ WSTRZYMANIA**
+        - Brak wyraźnego trendu
+        - Poczekaj na lepsze sygnały
+        - Monitoruj kluczowe poziomy wsparcia/oporu
+        """)
+    
+    # Disclaimer
+    st.markdown("---")
+    st.caption("""
+    ⚠️ **OSTRZEŻENIE**: Ta aplikacja służy wyłącznie celom edukacyjnym i informacyjnym. 
+    Nie stanowi porady inwestycyjnej. Handel na giełdzie wiąże się z ryzykiem straty kapitału.
+    Zawsze przeprowadź własną analizę przed podjęciem decyzji inwestycyjnych.
+    """)
 
-        st.markdown("#### Ważność cech")
-        imp = res["importances"].reset_index()
-        imp.columns = ["Cecha", "Ważność"]
-        fig_imp = go.Figure()
-        fig_imp.add_bar(x=imp["Cecha"], y=imp["Ważność"])
-        fig_imp.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig_imp, use_container_width=True)
-
-        st.caption("Model: RandomForestClassifier (bez strojenia hiperparametrów). Cel: wzrost ceny kolejnego dnia.")
-
-# --- Skaner WIG20 ---
-with tab_screener:
-    st.markdown("### Skaner sygnałów — WIG20")
-    scan_period = st.selectbox("Zakres dla skanera", ["3mo", "6mo", "1y"], index=0, key="scan_period")
-    results = []
-    for name, sym in wig20_dict.items():
-        try:
-            d0 = load_ohlc(sym, scan_period, "1d").tail(120)
-            if d0.empty:
-                results.append((name, sym, "NO DATA", np.nan, np.nan))
-                continue
-            ds = build_signals(d0)
-            if ds.empty:
-                results.append((name, sym, "NO INDICATORS", np.nan, np.nan))
-                continue
-            last = ds.iloc[-1]
-            results.append((name, sym, last["SIGNAL"], float(last["CLOSE"]), float(last["RSI_14"])))
-        except Exception:
-            results.append((name, sym, "ERROR", np.nan, np.nan))
-
-    scan_df = pd.DataFrame(results, columns=["Spółka", "Ticker", "Sygnał", "Kurs", "RSI_14"])
-    # sortuj BUY > NEUTRAL > SELL i po RSI
-    cat = pd.CategoricalDtype(categories=["BUY", "NEUTRAL", "SELL", "NO DATA", "NO INDICATORS", "ERROR"], ordered=True)
-    scan_df["Sygnał"] = scan_df["Sygnał"].astype(cat)
-    scan_df = scan_df.sort_values(["Sygnał", "RSI_14"], ascending=[True, True])
-
-    def color_signal(val: str) -> str:
-        if val == "BUY": return "🟢 BUY"
-        if val == "SELL": return "🔴 SELL"
-        if val == "NEUTRAL": return "⚪ NEUTRAL"
-        return f"⚠️ {val}"
-
-    scan_df["Sygnał"] = scan_df["Sygnał"].astype(str).map(color_signal)
-    st.dataframe(scan_df, use_container_width=True, hide_index=True)
-
-# ------------------------------
-# STOPKA / DISCLAIMER
-# ------------------------------
-st.markdown("---")
-st.caption("⚠️ To narzędzie ma charakter wyłącznie informacyjny i edukacyjny. "
-           "Nie stanowi rekomendacji inwestycyjnej. Inwestowanie na rynkach finansowych wiąże się z ryzykiem.")
+if __name__ == "__main__":
+    main()
