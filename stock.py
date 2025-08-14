@@ -121,37 +121,82 @@ def find_ohlc_columns(df):
 @st.cache_data(ttl=300)  # Cache na 5 minut
 def load_data(symbol, period, interval):
     try:
-        df = yf.download(symbol, period=period, interval=interval)
+        # Pobierz dane z yfinance
+        df = yf.download(symbol, period=period, interval=interval, progress=False)
         if df.empty:
-            return df
+            return df, "Brak danych"
+        
+        # Debug: pokaż oryginalne kolumny
+        st.write("🔍 **Debug - Oryginalne kolumny:**", df.columns.tolist())
         
         df = flatten_columns(df)
         
-        # Wskaźniki techniczne
-        df.ta.sma(length=20, append=True)
-        df.ta.sma(length=50, append=True)
-        df.ta.sma(length=200, append=True)
-        df.ta.ema(length=12, append=True)
-        df.ta.ema(length=26, append=True)
-        df.ta.bbands(length=20, std=2, append=True)
-        df.ta.rsi(length=14, append=True)
-        df.ta.macd(append=True)
-        df.ta.stoch(append=True)
-        df.ta.adx(append=True)
-        df.ta.cci(append=True)
-        df.ta.willr(append=True)
+        # Debug: pokaż kolumny po przetworzeniu
+        st.write("🔍 **Debug - Kolumny po przetworzeniu:**", df.columns.tolist())
+        
+        # Znajdź kolumny OHLC
+        ohlc_cols = find_ohlc_columns(df)
+        st.write("🔍 **Debug - Znalezione kolumny OHLC:**", ohlc_cols)
+        
+        # Sprawdź czy mamy podstawowe dane
+        required_cols = ['OPEN', 'HIGH', 'LOW', 'CLOSE']
+        missing_cols = [col for col in required_cols if ohlc_cols.get(col) is None]
+        
+        if missing_cols:
+            return df, f"Brak wymaganych kolumn: {missing_cols}"
+        
+        # Użyj znalezionych nazw kolumn
+        close_col = ohlc_cols['CLOSE']
+        high_col = ohlc_cols['HIGH']
+        low_col = ohlc_cols['LOW']
+        open_col = ohlc_cols['OPEN']
+        volume_col = ohlc_cols.get('VOLUME')
+        
+        # Wskaźniki techniczne - używaj właściwych nazw kolumn
+        try:
+            # Podstawowe średnie
+            df.ta.sma(close=close_col, length=20, append=True)
+            df.ta.sma(close=close_col, length=50, append=True)
+            df.ta.sma(close=close_col, length=200, append=True)
+            df.ta.ema(close=close_col, length=12, append=True)
+            df.ta.ema(close=close_col, length=26, append=True)
+            
+            # Bollinger Bands
+            df.ta.bbands(close=close_col, length=20, std=2, append=True)
+            
+            # RSI
+            df.ta.rsi(close=close_col, length=14, append=True)
+            
+            # MACD
+            df.ta.macd(close=close_col, append=True)
+            
+            # Inne wskaźniki
+            df.ta.stoch(high=high_col, low=low_col, close=close_col, append=True)
+            df.ta.adx(high=high_col, low=low_col, close=close_col, append=True)
+            df.ta.cci(high=high_col, low=low_col, close=close_col, append=True)
+            df.ta.willr(high=high_col, low=low_col, close=close_col, append=True)
+            
+        except Exception as indicator_error:
+            st.warning(f"Ostrzeżenie przy obliczaniu wskaźników: {indicator_error}")
         
         # Dodatkowe cechy dla ML
-        df['PRICE_CHANGE'] = df['CLOSE'].pct_change()
-        df['VOLUME_MA'] = df['VOLUME'].rolling(20).mean()
-        df['VOLUME_RATIO'] = df['VOLUME'] / df['VOLUME_MA']
-        df['HIGH_LOW_PCT'] = (df['HIGH'] - df['LOW']) / df['CLOSE']
-        df['CLOSE_OPEN_PCT'] = (df['CLOSE'] - df['OPEN']) / df['OPEN']
+        try:
+            df['PRICE_CHANGE'] = df[close_col].pct_change()
+            
+            if volume_col and volume_col in df.columns:
+                df['VOLUME_MA'] = df[volume_col].rolling(20).mean()
+                df['VOLUME_RATIO'] = df[volume_col] / df['VOLUME_MA']
+            
+            df['HIGH_LOW_PCT'] = (df[high_col] - df[low_col]) / df[close_col]
+            df['CLOSE_OPEN_PCT'] = (df[close_col] - df[open_col]) / df[open_col]
+            
+        except Exception as feature_error:
+            st.warning(f"Ostrzeżenie przy tworzeniu cech: {feature_error}")
         
-        return df
+        return df, None
+        
     except Exception as e:
-        st.error(f"Błąd podczas pobierania danych: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), f"Błąd podczas pobierania danych: {e}"
 
 def create_features(df):
     """Tworzenie cech dla modelu ML"""
@@ -185,7 +230,16 @@ def create_features(df):
 
 def create_target(df, forward_days=5, threshold=0.02):
     """Tworzenie zmiennej docelowej - czy cena wzrośnie o threshold% w ciągu forward_days"""
-    future_return = df['CLOSE'].shift(-forward_days) / df['CLOSE'] - 1
+    close_col = None
+    for col in df.columns:
+        if 'CLOSE' in col.upper():
+            close_col = col
+            break
+    
+    if close_col is None:
+        return np.array([])
+    
+    future_return = df[close_col].shift(-forward_days) / df[close_col] - 1
     target = np.where(future_return > threshold, 2,  # Strong Buy
                      np.where(future_return < -threshold, 0, 1))  # Sell, Hold, Buy
     return target
@@ -273,10 +327,23 @@ def calculate_traditional_signals(df):
         else:
             signals["SMA"] = "SELL"
     
-    if 'BBL_20_2.0' in df.columns and 'BBU_20_2.0' in df.columns and 'CLOSE' in df.columns:
-        close = df['CLOSE'].iloc[-1]
-        bb_lower = df['BBL_20_2.0'].iloc[-1]
-        bb_upper = df['BBU_20_2.0'].iloc[-1]
+    # Znajdź kolumny Bollinger Bands i Close
+    close_col = None
+    bb_lower_col = None
+    bb_upper_col = None
+    
+    for col in df.columns:
+        if 'CLOSE' in col.upper():
+            close_col = col
+        elif 'BBL' in col:
+            bb_lower_col = col
+        elif 'BBU' in col:
+            bb_upper_col = col
+    
+    if close_col and bb_lower_col and bb_upper_col:
+        close = df[close_col].iloc[-1]
+        bb_lower = df[bb_lower_col].iloc[-1]
+        bb_upper = df[bb_upper_col].iloc[-1]
         
         if close <= bb_lower:
             signals["Bollinger"] = "BUY"
@@ -356,10 +423,13 @@ def main():
         signal_emoji = "🟡"
     
     # Wyświetlanie głównego sygnału
+    close_col = ohlc_cols['CLOSE']
+    current_price = df[close_col].iloc[-1]
+    
     st.markdown(f"""
     <div class="signal-box {signal_class}">
         <h2>{signal_emoji} GŁÓWNY SYGNAŁ: {main_signal}</h2>
-        <p>Aktualna cena: <strong>{df['CLOSE'].iloc[-1]:.2f} PLN</strong></p>
+        <p>Aktualna cena: <strong>{current_price:.2f} PLN</strong></p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -390,10 +460,10 @@ def main():
         # Świece
         fig_price.add_trace(go.Candlestick(
             x=df.index,
-            open=df['OPEN'],
-            high=df['HIGH'],
-            low=df['LOW'],
-            close=df['CLOSE'],
+            open=df[ohlc_cols['OPEN']],
+            high=df[ohlc_cols['HIGH']],
+            low=df[ohlc_cols['LOW']],
+            close=df[ohlc_cols['CLOSE']],
             increasing_line_color='#00C851',
             decreasing_line_color='#FF4444',
             name='Cena'
@@ -416,11 +486,19 @@ def main():
                                          line=dict(color='purple', width=2)))
         
         # Bollinger Bands
-        if 'BBU_20_2.0' in df.columns and 'BBL_20_2.0' in df.columns:
-            fig_price.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], 
+        bb_upper_col = None
+        bb_lower_col = None
+        for col in df.columns:
+            if 'BBU' in col:
+                bb_upper_col = col
+            elif 'BBL' in col:
+                bb_lower_col = col
+        
+        if bb_upper_col and bb_lower_col:
+            fig_price.add_trace(go.Scatter(x=df.index, y=df[bb_upper_col], 
                                          mode='lines', name='BB Upper', 
                                          line=dict(color='gray', dash='dash')))
-            fig_price.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], 
+            fig_price.add_trace(go.Scatter(x=df.index, y=df[bb_lower_col], 
                                          mode='lines', name='BB Lower', 
                                          line=dict(color='gray', dash='dash')))
         
@@ -463,8 +541,10 @@ def main():
     # Podsumowanie i rekomendacje
     st.subheader("📋 Podsumowanie i rekomendacje")
     
-    current_price = df['CLOSE'].iloc[-1]
-    price_change = df['PRICE_CHANGE'].iloc[-1] * 100 if 'PRICE_CHANGE' in df.columns else 0
+    # Oblicz zmianę ceny
+    price_change = 0
+    if len(df) > 1:
+        price_change = ((current_price - df[close_col].iloc[-2]) / df[close_col].iloc[-2]) * 100
     
     col5, col6, col7 = st.columns(3)
     
@@ -473,8 +553,12 @@ def main():
                  f"{price_change:+.2f}%")
     
     with col6:
-        volume = df['VOLUME'].iloc[-1] if 'VOLUME' in df.columns else 0
-        st.metric("Wolumen", f"{volume:,.0f}")
+        volume_col = ohlc_cols.get('VOLUME')
+        if volume_col and volume_col in df.columns:
+            volume = df[volume_col].iloc[-1]
+            st.metric("Wolumen", f"{volume:,.0f}")
+        else:
+            st.metric("Wolumen", "N/A")
     
     with col7:
         if 'RSI_14' in df.columns:
